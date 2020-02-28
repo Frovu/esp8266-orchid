@@ -40,6 +40,10 @@
 					<td><!--#heap--> bytes</td>
 				</tr>
 				<tr>
+					<td><b>System time:</b></td>
+					<td><!--#time--></td>
+				</tr>
+				<tr>
 					<td><b>LED state:</b></td>
 					<td id="ledState"><!--#led--></td>
 				</tr>

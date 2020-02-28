@@ -11,13 +11,30 @@
 #include <ssid_config.h>
 #include <httpd/httpd.h>
 
+/* Add extras/sntp component to makefile for this include to work */
+#include <sntp.h>
+#include <time.h>
+
+#define SNTP_SERVERS 	"0.pool.ntp.org", "1.pool.ntp.org", \
+						"2.pool.ntp.org", "3.pool.ntp.org"
+
 #define LED_PIN 2
+
+#define NTP_S_RATE 10 // in minutes
+
+time_t ts; // tmp var for time
+
+#define vTaskDelayMs(ms)	vTaskDelay((ms)/portTICK_PERIOD_MS)
+#define UNUSED_ARG(x)	(void)x
 
 enum {
     SSI_UPTIME,
     SSI_FREE_HEAP,
+    SSI_SYS_TIME,
     SSI_LED_STATE
 };
+
+
 
 int32_t ssi_handler(int32_t iIndex, char *pcInsert, int32_t iInsertLen)
 {
@@ -28,6 +45,10 @@ int32_t ssi_handler(int32_t iIndex, char *pcInsert, int32_t iInsertLen)
             break;
         case SSI_FREE_HEAP:
             snprintf(pcInsert, iInsertLen, "%d", (int) xPortGetFreeHeapSize());
+            break;
+        case SSI_SYS_TIME:
+    		    ts = time(NULL);
+            snprintf(pcInsert, iInsertLen, "%s", ctime(&ts));
             break;
         case SSI_LED_STATE:
             snprintf(pcInsert, iInsertLen, (GPIO.OUT & BIT(LED_PIN)) ? "Off" : "On");
@@ -61,107 +82,22 @@ const char *gpio_cgi_handler(int iIndex, int iNumParams, char *pcParam[], char *
     return "/index.ssi";
 }
 
-const char *about_cgi_handler(int iIndex, int iNumParams, char *pcParam[], char *pcValue[])
+const char *help_cgi_handler(int iIndex, int iNumParams, char *pcParam[], char *pcValue[])
 {
-    return "/about.html";
-}
-
-const char *websocket_cgi_handler(int iIndex, int iNumParams, char *pcParam[], char *pcValue[])
-{
-    return "/websockets.html";
-}
-
-void websocket_task(void *pvParameter)
-{
-    struct tcp_pcb *pcb = (struct tcp_pcb *) pvParameter;
-
-    for (;;) {
-        if (pcb == NULL || pcb->state != ESTABLISHED) {
-            printf("Connection closed, deleting task\n");
-            break;
-        }
-
-        int uptime = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
-        int heap = (int) xPortGetFreeHeapSize();
-        int led = !gpio_read(LED_PIN);
-
-        /* Generate response in JSON format */
-        char response[64];
-        int len = snprintf(response, sizeof (response),
-                "{\"uptime\" : \"%d\","
-                " \"heap\" : \"%d\","
-                " \"led\" : \"%d\"}", uptime, heap, led);
-        if (len < sizeof (response))
-            websocket_write(pcb, (unsigned char *) response, len, WS_TEXT_MODE);
-
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
-    }
-
-    vTaskDelete(NULL);
-}
-
-/**
- * This function is called when websocket frame is received.
- *
- * Note: this function is executed on TCP thread and should return as soon
- * as possible.
- */
-void websocket_cb(struct tcp_pcb *pcb, uint8_t *data, u16_t data_len, uint8_t mode)
-{
-    printf("[websocket_callback]:\n%.*s\n", (int) data_len, (char*) data);
-
-    uint8_t response[2];
-    uint16_t val;
-
-    switch (data[0]) {
-        case 'A': // ADC
-            /* This should be done on a separate thread in 'real' applications */
-            val = sdk_system_adc_read();
-            break;
-        case 'D': // Disable LED
-            gpio_write(LED_PIN, true);
-            val = 0xDEAD;
-            break;
-        case 'E': // Enable LED
-            gpio_write(LED_PIN, false);
-            val = 0xBEEF;
-            break;
-        default:
-            printf("Unknown command\n");
-            val = 0;
-            break;
-    }
-
-    response[1] = (uint8_t) val;
-    response[0] = val >> 8;
-
-    websocket_write(pcb, response, 2, WS_BIN_MODE);
-}
-
-/**
- * This function is called when new websocket is open and
- * creates a new websocket_task if requested URI equals '/stream'.
- */
-void websocket_open_cb(struct tcp_pcb *pcb, const char *uri)
-{
-    printf("WS URI: %s\n", uri);
-    if (!strcmp(uri, "/stream")) {
-        printf("request for streaming\n");
-        xTaskCreate(&websocket_task, "websocket_task", 256, (void *) pcb, 2, NULL);
-    }
+    return "/help.html";
 }
 
 void httpd_task(void *pvParameters)
 {
     tCGI pCGIs[] = {
         {"/gpio", (tCGIHandler) gpio_cgi_handler},
-        {"/about", (tCGIHandler) about_cgi_handler},
-        {"/websockets", (tCGIHandler) websocket_cgi_handler},
+        {"/help", (tCGIHandler) help_cgi_handler}
     };
 
     const char *pcConfigSSITags[] = {
         "uptime", // SSI_UPTIME
         "heap",   // SSI_FREE_HEAP
+        "time",   // SSI_SYS_TIME
         "led"     // SSI_LED_STATE
     };
 
@@ -169,11 +105,40 @@ void httpd_task(void *pvParameters)
     http_set_cgi_handlers(pCGIs, sizeof (pCGIs) / sizeof (pCGIs[0]));
     http_set_ssi_handler((tSSIHandler) ssi_handler, pcConfigSSITags,
             sizeof (pcConfigSSITags) / sizeof (pcConfigSSITags[0]));
-    websocket_register_callbacks((tWsOpenHandler) websocket_open_cb,
-            (tWsHandler) websocket_cb);
     httpd_init();
 
-    for (;;);
+    for (;;)vTaskDelayMs(1000);
+}
+
+void sntp_task(void *pvParameters)
+{
+	const char *servers[] = {SNTP_SERVERS};
+
+	/* Wait until we have joined AP and are assigned an IP */
+	while (sdk_wifi_station_get_connect_status() != STATION_GOT_IP) {
+		vTaskDelayMs(100);
+	}
+
+	/* Start SNTP */
+	printf("Starting SNTP... ");
+	/* SNTP will request an update each 5 minutes */
+	sntp_set_update_delay(NTP_S_RATE*60000);
+	/* Set GMT+3 zone, daylight savings off */
+	const struct timezone tz = {3*60, 0};
+	/* SNTP initialization */
+	LOCK_TCPIP_CORE();
+	sntp_initialize(&tz);
+	UNLOCK_TCPIP_CORE();
+	/* Servers must be configured right after initialization */
+	sntp_set_servers(servers, sizeof(servers) / sizeof(char*));
+	printf("DONE!\n");
+
+	/* Print date and time each 5 seconds */
+	while(1) {
+		vTaskDelayMs(5000);
+		ts = time(NULL);
+		printf("TIME: %s", ctime(&ts));
+	}
 }
 
 void user_init(void)
@@ -196,5 +161,6 @@ void user_init(void)
     gpio_write(LED_PIN, true);
 
     /* initialize tasks */
-    xTaskCreate(&httpd_task, "HTTP Daemon", 2*configMINIMAL_STACK_SIZE, NULL, 2, NULL);
+    xTaskCreate(&httpd_task, "HTTP Daemon", 2*configMINIMAL_STACK_SIZE, NULL, 1, NULL);
+    xTaskCreate(&sntp_task, "SNTP", 2*configMINIMAL_STACK_SIZE, NULL, 1, NULL);
 }
